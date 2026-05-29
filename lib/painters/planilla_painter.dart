@@ -79,7 +79,7 @@ class PlanillaPainter extends CustomPainter {
       PlanillaConfig.asientoLabel,
       Offset(boxL, boxT),
       boxW,
-      boxH,
+      boxH - 1,
       fontSize: h * PlanillaConfig.fontSizeAsiento,
       weight: PlanillaConfig.weightAsiento,
       align: TextAlign.center,

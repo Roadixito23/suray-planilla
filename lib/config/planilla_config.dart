@@ -76,7 +76,7 @@ class PlanillaConfig {
 
   // ── Tamaños de fuente (×h, altura de celda) ──────────────────────────────────
   static const double fontSizeAsiento = 0.085;
-  static const double fontSizeDestino = 0.09;
+  static const double fontSizeDestino = 0.095;
   static const double fontSizePresentacion = 0.075;
   static const double fontSizeHora = 0.082;
   static const double fontSizeRevise = 0.12;
