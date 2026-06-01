@@ -14,6 +14,10 @@ class PlanillaConfig {
   static const int cols = 5;
   static const int rows = 9;
 
+  // ── Gaps entre boletos (fracción del ancho/alto total del canvas) ────────────
+  static const double gapHFraction = 0.014; // ≈ 10 / 707 px referencia
+  static const double gapVFraction = 0.003; // ≈  3 / 1000 px referencia
+
   // ── Proporciones de filas (deben sumar 1.0) ─────────────────────────────────
   /// Fila 1: caja de asiento + texto de destino
   static const double row1Fraction = 0.30;
@@ -62,7 +66,7 @@ class PlanillaConfig {
 
   /// Líneas del destino (fila 1 derecha). Máximo 3 líneas.
   static const List<String> destinationLines = [
-    'Aysén',
+    'Destino:',
     'Coyhaique',
     'Intermedios',
   ];
@@ -76,7 +80,7 @@ class PlanillaConfig {
 
   // ── Tamaños de fuente (×h, altura de celda) ──────────────────────────────────
   static const double fontSizeAsiento = 0.085;
-  static const double fontSizeDestino = 0.095;
+  static const double fontSizeDestino = 0.091;
   static const double fontSizePresentacion = 0.075;
   static const double fontSizeHora = 0.082;
   static const double fontSizeRevise = 0.12;
@@ -91,9 +95,9 @@ class PlanillaConfig {
   // ── Interlineado ─────────────────────────────────────────────────────────────
   static const double lineHeight = 1.15;
 
-  // ── Grosores de línea ────────────────────────────────────────────────────────
-  static const double strokeThin = 0.5;
-  static const double strokeThick = 1.4;
+  // ── Grosores de línea (fracción de cellH para escalar con el canvas) ─────────
+  static const double strokeThinFraction  = 0.005; // ≈ 0.5 / 108
+  static const double strokeThickFraction = 0.013; // ≈ 1.4 / 108
 
   // ── Padding interior de texto (×w o ×h) ──────────────────────────────────────
   /// Padding horizontal para "Hora" y "2026"
@@ -105,8 +109,14 @@ class PlanillaConfig {
   /// Padding derecho del texto de destino (×w)
   static const double destinoPaddingRight = 0.0001;
 
-  /// Offset vertical de la fila de destino desde el top (×h)
-  static const double destinoTopOffset = 0.01;
+  /// Offset vertical de la fila de destino desde el top (×h) — ≈ 5 / 108
+  static const double destinoTopOffset = 0.046;
+
+  /// Offset vertical de texto justo bajo un separador de fila (×h) — ≈ 7 / 108
+  static const double textRowVOffset = 0.065;
+
+  /// Reducción de alto para el valor de hora/fecha (×h) — ≈ 2 / 108
+  static const double textRowVShrink = 0.019;
 
   // ── Colores ───────────────────────────────────────────────────────────────────
   static const Color inkColor = Colors.black;

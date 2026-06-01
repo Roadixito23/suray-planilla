@@ -2,10 +2,23 @@ import 'package:flutter/material.dart';
 import '../painters/planilla_painter.dart';
 import 'home_screen.dart';
 
-class PlanillaScreen extends StatelessWidget {
+class PlanillaScreen extends StatefulWidget {
   final PaperSize paperSize;
 
   const PlanillaScreen({super.key, required this.paperSize});
+
+  @override
+  State<PlanillaScreen> createState() => _PlanillaScreenState();
+}
+
+class _PlanillaScreenState extends State<PlanillaScreen> {
+  String _destination = 'Coyhaique';
+
+  void _toggleDestination() {
+    setState(() {
+      _destination = _destination == 'Coyhaique' ? 'Aysen' : 'Coyhaique';
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -16,9 +29,18 @@ class PlanillaScreen extends StatelessWidget {
         elevation: 0,
         centerTitle: true,
         title: Text(
-          'Planilla ${paperSize.label}',
+          'Planilla ${widget.paperSize.label}',
           style: const TextStyle(fontWeight: FontWeight.bold),
         ),
+        actions: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            child: FilledButton.tonal(
+              onPressed: _toggleDestination,
+              child: Text(_destination),
+            ),
+          ),
+        ],
       ),
       body: InteractiveViewer(
         minScale: 0.4,
@@ -28,7 +50,7 @@ class PlanillaScreen extends StatelessWidget {
           child: Padding(
             padding: const EdgeInsets.all(32),
             child: AspectRatio(
-              aspectRatio: paperSize.aspectRatio,
+              aspectRatio: widget.paperSize.aspectRatio,
               child: Container(
                 decoration: const BoxDecoration(
                   color: Colors.white,
@@ -41,7 +63,11 @@ class PlanillaScreen extends StatelessWidget {
                   ],
                 ),
                 child: CustomPaint(
-                  painter: PlanillaPainter(),
+                  painter: PlanillaPainter(
+                    destination: _destination,
+                    time: '00:00',
+                    date: '29/05',
+                  ),
                 ),
               ),
             ),
