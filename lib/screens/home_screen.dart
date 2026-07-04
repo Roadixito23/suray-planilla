@@ -4,21 +4,11 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:printing/printing.dart';
 import '../models/feriado.dart';
+import '../models/paper_size.dart';
 import '../painters/planilla_painter.dart';
 import '../services/pdf_cache_service.dart';
 import 'horarios_dialog.dart';
 import 'tanda_screen.dart';
-
-enum PaperSize { a4, carta }
-
-extension PaperSizeInfo on PaperSize {
-  String get label => this == PaperSize.a4 ? 'A4' : 'Carta';
-  String get dimensions =>
-      this == PaperSize.a4 ? '210 × 297 mm' : '215.9 × 279.4 mm';
-  double get widthMm => this == PaperSize.a4 ? 210 : 215.9;
-  double get heightMm => this == PaperSize.a4 ? 297 : 279.4;
-  double get aspectRatio => widthMm / heightMm;
-}
 
 const _kBlue = Color(0xFF7B1F2E);
 const _kHunterGreen = Color(0xFF355E3B);

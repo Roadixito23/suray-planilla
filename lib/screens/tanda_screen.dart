@@ -1,14 +1,22 @@
+import 'dart:convert';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/feriado.dart';
+import '../models/paper_size.dart';
 import '../painters/planilla_painter.dart';
 import '../services/feriados_service.dart';
 import 'horarios_dialog.dart';
 
 enum TandaMode { dia, semana }
+
+// ── Claves de SharedPreferences (avance de Tanda) ──────────────────────────────
+const _kKeyTandaPrintedWeek = 'tanda_printed_week';
+const _kKeyTandaPrintedDays = 'tanda_printed_days';
+const _kKeyTandaDestination = 'tanda_day_destination';
 
 // ── Colores ───────────────────────────────────────────────────────────────────
 const _kLVColor = Color(0xFF355E3B);
@@ -138,6 +146,7 @@ class _TandaPanelState extends State<TandaPanel> {
   late DateTime _month;
   final _loadingYears = <int>{};
   String _dayDestination = 'Coyhaique';
+  PaperSize _paper = PaperSize.a4;
   // Índices de días (0=Lun…6=Dom) ya impresos de la semana actual
   final _printedDays = <int>{};
   String? _weekKeyPrinted; // clave de la semana para resetear al cambiar
@@ -191,6 +200,7 @@ class _TandaPanelState extends State<TandaPanel> {
         feriados,
         _dayDestination,
         selectedTimes: selected,
+        paper: _paper,
       ),
       onStart: onStart,
       onEnd: onEnd,
@@ -202,7 +212,38 @@ class _TandaPanelState extends State<TandaPanel> {
     if (key != _weekKeyPrinted) {
       _printedDays.clear();
       _weekKeyPrinted = key;
+      _saveProgress();
     }
+  }
+
+  // ── Persistencia del avance (días ya impresos + destino) ──
+  Future<void> _loadProgress() async {
+    final prefs = await SharedPreferences.getInstance();
+    final week = prefs.getString(_kKeyTandaPrintedWeek);
+    final daysRaw = prefs.getString(_kKeyTandaPrintedDays);
+    final dest = prefs.getString(_kKeyTandaDestination);
+    if (!mounted) return;
+    setState(() {
+      if (week != null) _weekKeyPrinted = week;
+      if (daysRaw != null) {
+        _printedDays
+          ..clear()
+          ..addAll(List<int>.from(jsonDecode(daysRaw) as List));
+      }
+      if (dest != null) _dayDestination = dest;
+    });
+  }
+
+  Future<void> _saveProgress() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (_weekKeyPrinted != null) {
+      await prefs.setString(_kKeyTandaPrintedWeek, _weekKeyPrinted!);
+    }
+    await prefs.setString(
+      _kKeyTandaPrintedDays,
+      jsonEncode(_printedDays.toList()),
+    );
+    await prefs.setString(_kKeyTandaDestination, _dayDestination);
   }
 
   Future<void> _loadFeriadosForMonth(DateTime month) async {
@@ -238,6 +279,7 @@ class _TandaPanelState extends State<TandaPanel> {
       widget.weekNotifier.value = _weekMon(now);
     }
     Future.microtask(() => _loadFeriadosForMonth(_month));
+    _loadProgress();
   }
 
   @override
@@ -269,6 +311,26 @@ class _TandaPanelState extends State<TandaPanel> {
                 ),
               ],
             ),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: _PaperSizeButton(
+                  size: PaperSize.a4,
+                  selected: _paper == PaperSize.a4,
+                  onTap: () => setState(() => _paper = PaperSize.a4),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: _PaperSizeButton(
+                  size: PaperSize.carta,
+                  selected: _paper == PaperSize.carta,
+                  onTap: () => setState(() => _paper = PaperSize.carta),
+                ),
+              ),
+            ],
           ),
           const SizedBox(height: 12),
           _buildCalendar(),
@@ -367,7 +429,8 @@ class _TandaPanelState extends State<TandaPanel> {
                   onPressed: _isPrintingTanda
                       ? null
                       : () => _guardedPrint(
-                          printFn: () => printTandaPdf(week, data, feriados),
+                          printFn: () =>
+                              printTandaPdf(week, data, feriados, paper: _paper),
                           onStart: () =>
                               setState(() => _isPrintingTanda = true),
                           onEnd: () =>
@@ -496,13 +559,21 @@ class _TandaPanelState extends State<TandaPanel> {
               onPressed: _printingDays.contains(idx)
                   ? null
                   : () => _guardedPrint(
-                      printFn: () =>
-                          printDiaPdf(date, data, feriados, _dayDestination),
+                      printFn: () => printDiaPdf(
+                        date,
+                        data,
+                        feriados,
+                        _dayDestination,
+                        paper: _paper,
+                      ),
                       onStart: () => setState(() => _printingDays.add(idx)),
-                      onEnd: () => setState(() {
-                        _printingDays.remove(idx);
-                        _printedDays.add(idx);
-                      }),
+                      onEnd: () {
+                        setState(() {
+                          _printingDays.remove(idx);
+                          _printedDays.add(idx);
+                        });
+                        _saveProgress();
+                      },
                     ),
             ),
             if (times.length > 1)
@@ -530,10 +601,13 @@ class _TandaPanelState extends State<TandaPanel> {
                           idx: idx,
                           onStart: () =>
                               setState(() => _printingDays.add(idx)),
-                          onEnd: () => setState(() {
-                            _printingDays.remove(idx);
-                            _printedDays.add(idx);
-                          }),
+                          onEnd: () {
+                            setState(() {
+                              _printingDays.remove(idx);
+                              _printedDays.add(idx);
+                            });
+                            _saveProgress();
+                          },
                         ),
                 ),
               ),
@@ -621,11 +695,14 @@ class _TandaPanelState extends State<TandaPanel> {
                         ? 'Coyhaique'
                         : 'Aysén',
                     selected: _dayDestination == 'Coyhaique',
-                    onTap: () => setState(
-                      () => _dayDestination = _dayDestination == 'Coyhaique'
-                          ? 'Aysen'
-                          : 'Coyhaique',
-                    ),
+                    onTap: () {
+                      setState(
+                        () => _dayDestination = _dayDestination == 'Coyhaique'
+                            ? 'Aysen'
+                            : 'Coyhaique',
+                      );
+                      _saveProgress();
+                    },
                     color: ac,
                   ),
                 ),
@@ -668,10 +745,12 @@ class _TandaPanelState extends State<TandaPanel> {
                         ? null
                         : () => _guardedPrint(
                             printFn: () => printDiaPdf(
-                                day,
-                                widget.horariosNotifier.value,
-                                feriados,
-                                _dayDestination),
+                              day,
+                              widget.horariosNotifier.value,
+                              feriados,
+                              _dayDestination,
+                              paper: _paper,
+                            ),
                             onStart: () =>
                                 setState(() => _isPrintingDia = true),
                             onEnd: () =>
@@ -1299,15 +1378,16 @@ class _DayColumn extends StatelessWidget {
 Future<void> printTandaPdf(
   DateTime week,
   HorariosData data,
-  Map<String, Feriado> feriados,
-) async {
+  Map<String, Feriado> feriados, {
+  PaperSize paper = PaperSize.a4,
+}) async {
   final font = pw.Font.helvetica();
   final bold = pw.Font.helveticaBold();
 
   final doc = pw.Document();
   doc.addPage(
     pw.Page(
-      pageFormat: PdfPageFormat.a4.landscape,
+      pageFormat: paper.pdfFormat.landscape,
       margin: const pw.EdgeInsets.all(24),
       build: (ctx) => pw.Column(
         crossAxisAlignment: pw.CrossAxisAlignment.start,
@@ -1436,20 +1516,24 @@ Future<void> printDiaPdf(
   Map<String, Feriado> feriados,
   String destination, {
   List<String>? selectedTimes,
+  PaperSize paper = PaperSize.a4,
 }) async {
   final times = selectedTimes ?? _timesForDate(date, data, feriados);
   if (times.isEmpty) return;
 
-  // A4 en puntos PDF
-  const double pageW = 595.28;
-  const double pageH = 841.89;
+  final pageFormat = paper.pdfFormat;
+  final double pageW = pageFormat.width;
+  final double pageH = pageFormat.height;
   const double scale = 2.0;
   final int imgW = (pageW * scale).round();
   final int imgH = (pageH * scale).round();
   final dateStr = _fmt(date);
 
   final doc = pw.Document();
-  for (final time in times) {
+  // Se recorre en orden inverso: la impresora suele apilar las hojas boca
+  // abajo, por lo que la última en imprimirse queda arriba de la pila.
+  // Así, al tomar la pila física, el primer horario queda primero.
+  for (final time in times.reversed) {
     final recorder = ui.PictureRecorder();
     final canvas = Canvas(
       recorder,
@@ -1467,7 +1551,7 @@ Future<void> printDiaPdf(
     final bytes = byteData!.buffer.asUint8List();
     doc.addPage(
       pw.Page(
-        pageFormat: PdfPageFormat.a4,
+        pageFormat: pageFormat,
         margin: pw.EdgeInsets.zero,
         build: (_) => pw.Image(pw.MemoryImage(bytes), fit: pw.BoxFit.contain),
       ),
@@ -1615,6 +1699,62 @@ class _ModeButton extends StatelessWidget {
             fontWeight: FontWeight.w700,
             color: selected ? Colors.white : Colors.black54,
           ),
+        ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// _PaperSizeButton — botón de selección de tamaño de hoja (A4 / Carta)
+// ─────────────────────────────────────────────────────────────────────────────
+class _PaperSizeButton extends StatelessWidget {
+  final PaperSize size;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _PaperSizeButton({
+    required this.size,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        decoration: BoxDecoration(
+          color: selected ? _kHeaderDark : Colors.transparent,
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
+            color: selected ? _kHeaderDark : Colors.black26,
+            width: 1,
+          ),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              size.label,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                color: selected ? Colors.white : Colors.black54,
+              ),
+            ),
+            Text(
+              size.dimensions,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 9,
+                color: selected ? Colors.white70 : Colors.black38,
+              ),
+            ),
+          ],
         ),
       ),
     );
