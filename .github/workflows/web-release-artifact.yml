@@ -1,0 +1,42 @@
+name: Build Web Release Artifact
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build Flutter web
+        run: flutter build web --release
+
+      - name: Set release folder name
+        id: vars
+        run: echo "folder=web-release-$(date +'%d%m')" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare release folder
+        run: |
+          mkdir -p "${{ steps.vars.outputs.folder }}"
+          cp -r build/web/* "${{ steps.vars.outputs.folder }}/"
+
+      - name: Upload release folder as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.vars.outputs.folder }}
+          path: ${{ steps.vars.outputs.folder }}
+          retention-days: 30
