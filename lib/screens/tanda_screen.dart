@@ -1,7 +1,6 @@
 import 'dart:convert';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
-import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -11,26 +10,22 @@ import '../painters/planilla_painter.dart';
 import '../services/feriados_service.dart';
 import 'horarios_dialog.dart';
 
-enum TandaMode { dia, semana }
-
 // ── Claves de SharedPreferences (avance de Tanda) ──────────────────────────────
 const _kKeyTandaPrintedWeek = 'tanda_printed_week';
 const _kKeyTandaPrintedDays = 'tanda_printed_days';
 const _kKeyTandaDestination = 'tanda_day_destination';
+const _kKeyTandaPaperSize = 'tanda_paper_size';
 
 // ── Colores ───────────────────────────────────────────────────────────────────
 const _kLVColor = Color(0xFF355E3B);
 const _kLVLight = Color(0xFFECF4EC);
 const _kLVBorder = Color(0xFFAFCDB2);
-const _kLVDark = Color(0xFF1F3D23);
 const _kSabColor = Color(0xFF7A5C14);
 const _kSabLight = Color(0xFFF5EDD8);
 const _kSabBorder = Color(0xFFCFB26A);
-const _kSabDark = Color(0xFF54400D);
 const _kDomColor = Color(0xFF7B1F2E);
 const _kDomLight = Color(0xFFF5E8EA);
 const _kDomBorder = Color(0xFFCCA0A8);
-const _kDomDark = Color(0xFF4A0D17);
 const _kHeaderDark = Color(0xFF4A0D17);
 const _kBandBg = Color(0xFFF5DDE0);
 
@@ -60,16 +55,6 @@ const _longNames = [
   'Domingo',
 ];
 const _shortNames = ['Lu', 'Ma', 'Mi', 'Ju', 'Vi', 'Sá', 'Do'];
-// Sin tildes para el PDF (fuente básica)
-const _pdfNames = [
-  'Lunes',
-  'Martes',
-  'Miercoles',
-  'Jueves',
-  'Viernes',
-  'Sabado',
-  'Domingo',
-];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 DateTime _weekMon(DateTime d) =>
@@ -95,11 +80,6 @@ Color _border(int wd) => wd <= 5
     : wd == 6
     ? _kSabBorder
     : _kDomBorder;
-Color _dark(int wd) => wd <= 5
-    ? _kLVDark
-    : wd == 6
-    ? _kSabDark
-    : _kDomDark;
 List<String> _timesFor(int wd, HorariosData d) => wd <= 5
     ? d.lunesViernes
     : wd == 6
@@ -119,119 +99,71 @@ List<String> _timesForDate(
   return f.irrenunciable ? d.domingoFeriado : _timesFor(date.weekday, d);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TandaPanel — selector de semana (panel izquierdo)
-// ─────────────────────────────────────────────────────────────────────────────
-class TandaPanel extends StatefulWidget {
-  final ValueNotifier<DateTime?> weekNotifier;
-  final ValueNotifier<HorariosData> horariosNotifier;
-  final ValueNotifier<Map<String, Feriado>> feriadosNotifier;
-  final ValueNotifier<TandaMode> modeNotifier;
-  final ValueNotifier<DateTime?> dayNotifier;
-
-  const TandaPanel({
-    super.key,
-    required this.weekNotifier,
-    required this.horariosNotifier,
-    required this.feriadosNotifier,
-    required this.modeNotifier,
-    required this.dayNotifier,
-  });
-
-  @override
-  State<TandaPanel> createState() => _TandaPanelState();
+// Día efectivo para colorear (un feriado irrenunciable se trata como domingo).
+int _effectiveWeekday(DateTime date, Map<String, Feriado> feriados) {
+  final f = feriados[_dateKey(date)];
+  return (f?.irrenunciable == true && date.weekday < 7) ? 7 : date.weekday;
 }
 
-class _TandaPanelState extends State<TandaPanel> {
-  late DateTime _month;
-  final _loadingYears = <int>{};
-  String _dayDestination = 'Coyhaique';
-  PaperSize _paper = PaperSize.a4;
-  // Índices de días (0=Lun…6=Dom) ya impresos de la semana actual
-  final _printedDays = <int>{};
-  String? _weekKeyPrinted; // clave de la semana para resetear al cambiar
-  // Cooldown de impresión
-  bool _isPrintingTanda = false;
-  bool _isPrintingDia = false;
-  final _printingDays = <int>{};
+Future<void> _guardedPrint({
+  required Future<void> Function() printFn,
+  required VoidCallback onStart,
+  required VoidCallback onEnd,
+}) async {
+  onStart();
+  try {
+    await Future.wait([
+      printFn(),
+      Future.delayed(const Duration(milliseconds: 1500)),
+    ]);
+  } finally {
+    onEnd();
+  }
+}
 
-  Future<void> _guardedPrint({
-    required Future<void> Function() printFn,
-    required VoidCallback onStart,
-    required VoidCallback onEnd,
-  }) async {
-    onStart();
-    try {
-      await Future.wait([
-        printFn(),
-        Future.delayed(const Duration(milliseconds: 1500)),
-      ]);
-    } finally {
-      if (mounted) onEnd();
-    }
+// ─────────────────────────────────────────────────────────────────────────────
+// TandaController — estado compartido de impresión/avance entre panel
+// izquierdo y derecho (destino, tamaño de hoja, días impresos, día activo).
+// ─────────────────────────────────────────────────────────────────────────────
+class TandaController extends ChangeNotifier {
+  TandaController({
+    required this.horariosNotifier,
+    required this.feriadosNotifier,
+    required this.weekNotifier,
+    required this.dayNotifier,
+  }) {
+    weekNotifier.addListener(_onWeekChanged);
   }
 
-  // Abre el diálogo de selección de horarios y luego imprime los elegidos.
-  // [idx] es el índice en la semana (0–6) para actualizar _printedDays;
-  // null cuando se llama desde _buildDiaInfo.
-  Future<void> _showSelectAndPrint(
-    BuildContext context,
-    DateTime date,
-    HorariosData data,
-    Map<String, Feriado> feriados, {
-    int? idx,
-    required VoidCallback onStart,
-    required VoidCallback onEnd,
-  }) async {
-    final times = _timesForDate(date, data, feriados);
-    if (times.isEmpty) return;
+  final ValueNotifier<HorariosData> horariosNotifier;
+  final ValueNotifier<Map<String, Feriado>> feriadosNotifier;
+  final ValueNotifier<DateTime?> weekNotifier;
+  final ValueNotifier<DateTime?> dayNotifier;
 
-    final selected = await showDialog<List<String>>(
-      context: context,
-      builder: (_) => _SelectTimesDialog(times: times, date: date),
-    );
+  String destination = 'Coyhaique';
+  PaperSize paper = PaperSize.a4;
+  // Índices de días (0=Lun…6=Dom) ya impresos de la semana activa.
+  final Set<int> printedDays = {};
+  bool isPrinting = false;
+  String? _weekKeyPrinted;
+  bool _disposed = false;
 
-    if (selected == null || selected.isEmpty || !mounted) return;
-
-    await _guardedPrint(
-      printFn: () => printDiaPdf(
-        date,
-        data,
-        feriados,
-        _dayDestination,
-        selectedTimes: selected,
-        paper: _paper,
-      ),
-      onStart: onStart,
-      onEnd: onEnd,
-    );
-  }
-
-  void _resetIfNewWeek(DateTime week) {
-    final key = _dateKey(week);
-    if (key != _weekKeyPrinted) {
-      _printedDays.clear();
-      _weekKeyPrinted = key;
-      _saveProgress();
-    }
-  }
-
-  // ── Persistencia del avance (días ya impresos + destino) ──
-  Future<void> _loadProgress() async {
+  Future<void> loadProgress() async {
     final prefs = await SharedPreferences.getInstance();
     final week = prefs.getString(_kKeyTandaPrintedWeek);
     final daysRaw = prefs.getString(_kKeyTandaPrintedDays);
     final dest = prefs.getString(_kKeyTandaDestination);
-    if (!mounted) return;
-    setState(() {
-      if (week != null) _weekKeyPrinted = week;
-      if (daysRaw != null) {
-        _printedDays
-          ..clear()
-          ..addAll(List<int>.from(jsonDecode(daysRaw) as List));
-      }
-      if (dest != null) _dayDestination = dest;
-    });
+    final paperRaw = prefs.getString(_kKeyTandaPaperSize);
+    if (_disposed) return;
+    if (week != null) _weekKeyPrinted = week;
+    if (daysRaw != null) {
+      printedDays
+        ..clear()
+        ..addAll(List<int>.from(jsonDecode(daysRaw) as List));
+    }
+    if (dest != null) destination = dest;
+    if (paperRaw == 'carta') paper = PaperSize.carta;
+    notifyListeners();
   }
 
   Future<void> _saveProgress() async {
@@ -241,10 +173,108 @@ class _TandaPanelState extends State<TandaPanel> {
     }
     await prefs.setString(
       _kKeyTandaPrintedDays,
-      jsonEncode(_printedDays.toList()),
+      jsonEncode(printedDays.toList()),
     );
-    await prefs.setString(_kKeyTandaDestination, _dayDestination);
+    await prefs.setString(_kKeyTandaDestination, destination);
+    await prefs.setString(
+      _kKeyTandaPaperSize,
+      paper == PaperSize.a4 ? 'a4' : 'carta',
+    );
   }
+
+  void setDestination(String d) {
+    destination = d;
+    notifyListeners();
+    _saveProgress();
+  }
+
+  void setPaper(PaperSize p) {
+    paper = p;
+    notifyListeners();
+    _saveProgress();
+  }
+
+  // Reacciona a cambios de semana: resetea el avance si es una semana nueva
+  // y por defecto activa el lunes de esa semana.
+  void _onWeekChanged() {
+    final week = weekNotifier.value;
+    if (week == null) return;
+    final key = _dateKey(week);
+    final changed = key != _weekKeyPrinted;
+    if (changed) {
+      printedDays.clear();
+      _weekKeyPrinted = key;
+    }
+    if (changed || dayNotifier.value == null) {
+      dayNotifier.value = week;
+    }
+    if (changed) {
+      notifyListeners();
+      _saveProgress();
+    }
+  }
+
+  Future<void> printDay({
+    required DateTime date,
+    required int idxInWeek,
+    required HorariosData data,
+    required Map<String, Feriado> feriados,
+    required List<String> selectedTimes,
+  }) async {
+    if (isPrinting || selectedTimes.isEmpty) return;
+    await _guardedPrint(
+      printFn: () => printDiaPdf(
+        date,
+        data,
+        feriados,
+        destination,
+        selectedTimes: selectedTimes,
+        paper: paper,
+      ),
+      onStart: () {
+        if (_disposed) return;
+        isPrinting = true;
+        notifyListeners();
+      },
+      onEnd: () {
+        if (_disposed) return;
+        isPrinting = false;
+        notifyListeners();
+      },
+    );
+    if (_disposed) return;
+    printedDays.add(idxInWeek);
+    notifyListeners();
+    await _saveProgress();
+    if (_disposed) return;
+    if (idxInWeek < 6) {
+      dayNotifier.value = date.add(const Duration(days: 1));
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    weekNotifier.removeListener(_onWeekChanged);
+    super.dispose();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TandaPanel — calendario + navegador de días (panel izquierdo)
+// ─────────────────────────────────────────────────────────────────────────────
+class TandaPanel extends StatefulWidget {
+  final TandaController controller;
+
+  const TandaPanel({super.key, required this.controller});
+
+  @override
+  State<TandaPanel> createState() => _TandaPanelState();
+}
+
+class _TandaPanelState extends State<TandaPanel> {
+  late DateTime _month;
+  final _loadingYears = <int>{};
 
   Future<void> _loadFeriadosForMonth(DateTime month) async {
     final years = {month.year, if (month.month == 12) month.year + 1};
@@ -254,11 +284,13 @@ class _TandaPanelState extends State<TandaPanel> {
       try {
         final list = await FeriadosService.fetchYear(year);
         if (!mounted) return;
-        final map = Map<String, Feriado>.from(widget.feriadosNotifier.value);
+        final map = Map<String, Feriado>.from(
+          widget.controller.feriadosNotifier.value,
+        );
         for (final f in list) {
           map[_dateKey(f.fecha)] = f;
         }
-        widget.feriadosNotifier.value = map;
+        widget.controller.feriadosNotifier.value = map;
       } catch (_) {
         // silently fail — la tanda sigue funcionando sin feriados
       } finally {
@@ -271,15 +303,17 @@ class _TandaPanelState extends State<TandaPanel> {
   void initState() {
     super.initState();
     final now = DateTime.now();
-    if (widget.weekNotifier.value != null) {
-      final ws = widget.weekNotifier.value!;
-      _month = DateTime(ws.year, ws.month);
-    } else {
-      _month = DateTime(now.year, now.month);
-      widget.weekNotifier.value = _weekMon(now);
-    }
+    final ws = widget.controller.weekNotifier.value;
+    _month = ws != null
+        ? DateTime(ws.year, ws.month)
+        : DateTime(now.year, now.month);
     Future.microtask(() => _loadFeriadosForMonth(_month));
-    _loadProgress();
+    widget.controller.loadProgress().then((_) {
+      if (!mounted) return;
+      if (widget.controller.weekNotifier.value == null) {
+        widget.controller.weekNotifier.value = _weekMon(now);
+      }
+    });
   }
 
   @override
@@ -289,57 +323,33 @@ class _TandaPanelState extends State<TandaPanel> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // ── Selector de modo ──
-          ValueListenableBuilder<TandaMode>(
-            valueListenable: widget.modeNotifier,
-            builder: (_, mode, _) => Row(
+          // ── Tamaño de hoja ──
+          AnimatedBuilder(
+            animation: widget.controller,
+            builder: (_, _) => Row(
               children: [
                 Expanded(
-                  child: _ModeButton(
-                    label: 'Semana',
-                    selected: mode == TandaMode.semana,
-                    onTap: () => widget.modeNotifier.value = TandaMode.semana,
+                  child: _PaperSizeButton(
+                    size: PaperSize.a4,
+                    selected: widget.controller.paper == PaperSize.a4,
+                    onTap: () => widget.controller.setPaper(PaperSize.a4),
                   ),
                 ),
                 const SizedBox(width: 6),
                 Expanded(
-                  child: _ModeButton(
-                    label: 'Día',
-                    selected: mode == TandaMode.dia,
-                    onTap: () => widget.modeNotifier.value = TandaMode.dia,
+                  child: _PaperSizeButton(
+                    size: PaperSize.carta,
+                    selected: widget.controller.paper == PaperSize.carta,
+                    onTap: () => widget.controller.setPaper(PaperSize.carta),
                   ),
                 ),
               ],
             ),
           ),
           const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: _PaperSizeButton(
-                  size: PaperSize.a4,
-                  selected: _paper == PaperSize.a4,
-                  onTap: () => setState(() => _paper = PaperSize.a4),
-                ),
-              ),
-              const SizedBox(width: 6),
-              Expanded(
-                child: _PaperSizeButton(
-                  size: PaperSize.carta,
-                  selected: _paper == PaperSize.carta,
-                  onTap: () => setState(() => _paper = PaperSize.carta),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
           _buildCalendar(),
           const SizedBox(height: 16),
-          ValueListenableBuilder<TandaMode>(
-            valueListenable: widget.modeNotifier,
-            builder: (_, mode, _) =>
-                mode == TandaMode.semana ? _buildSemanaInfo() : _buildDiaInfo(),
-          ),
+          _buildSemanaInfo(),
         ],
       ),
     );
@@ -347,42 +357,61 @@ class _TandaPanelState extends State<TandaPanel> {
 
   Widget _buildSemanaInfo() {
     return ValueListenableBuilder<DateTime?>(
-      valueListenable: widget.weekNotifier,
+      valueListenable: widget.controller.weekNotifier,
       builder: (_, week, _) {
         if (week == null) return const SizedBox.shrink();
-        _resetIfNewWeek(week);
         final end = week.add(const Duration(days: 6));
         return ListenableBuilder(
           listenable: Listenable.merge([
-            widget.horariosNotifier,
-            widget.feriadosNotifier,
+            widget.controller,
+            widget.controller.dayNotifier,
+            widget.controller.horariosNotifier,
+            widget.controller.feriadosNotifier,
           ]),
           builder: (_, _) {
-            final data = widget.horariosNotifier.value;
-            final feriados = widget.feriadosNotifier.value;
+            final data = widget.controller.horariosNotifier.value;
+            final feriados = widget.controller.feriadosNotifier.value;
+            final doneCount = widget.controller.printedDays.length;
             return Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 // ── Info de semana ──
                 Container(
-                  padding: const EdgeInsets.all(10),
+                  padding: const EdgeInsets.all(12),
                   decoration: BoxDecoration(
                     color: _kBandBg,
-                    borderRadius: BorderRadius.circular(6),
+                    borderRadius: BorderRadius.circular(8),
                     border: Border.all(color: _kDomBorder),
                   ),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text(
-                        'Semana seleccionada',
-                        style: TextStyle(fontSize: 10, color: Colors.black45),
+                      Row(
+                        children: [
+                          const Expanded(
+                            child: Text(
+                              'Semana seleccionada',
+                              style: TextStyle(
+                                fontSize: 10,
+                                color: Colors.black45,
+                              ),
+                            ),
+                          ),
+                          Text(
+                            '$doneCount/7 impresos',
+                            style: TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.w700,
+                              color: _kDomColor.withAlpha(200),
+                            ),
+                          ),
+                        ],
                       ),
-                      const SizedBox(height: 3),
+                      const SizedBox(height: 4),
                       Text(
                         _fmtFull(week),
                         style: const TextStyle(
-                          fontSize: 12,
+                          fontSize: 13,
                           fontWeight: FontWeight.w700,
                         ),
                       ),
@@ -396,49 +425,32 @@ class _TandaPanelState extends State<TandaPanel> {
                     ],
                   ),
                 ),
-                const SizedBox(height: 12),
-                ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: _isPrintingTanda
-                        ? _kLVColor.withAlpha(160)
-                        : _kLVColor,
-                    foregroundColor: Colors.white,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(6),
+                const SizedBox(height: 10),
+                // ── Destino ──
+                Row(
+                  children: [
+                    const Text(
+                      'Destino:',
+                      style: TextStyle(fontSize: 11, color: Colors.black54),
                     ),
-                    padding: const EdgeInsets.symmetric(vertical: 11),
-                    elevation: 0,
-                  ),
-                  icon: _isPrintingTanda
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: Colors.white,
-                          ),
-                        )
-                      : const Icon(Icons.print_rounded, size: 16),
-                  label: Text(
-                    _isPrintingTanda ? 'Imprimiendo…' : 'Imprimir Tanda',
-                    style: const TextStyle(
-                      fontWeight: FontWeight.w700,
-                      fontSize: 13,
-                    ),
-                  ),
-                  onPressed: _isPrintingTanda
-                      ? null
-                      : () => _guardedPrint(
-                          printFn: () =>
-                              printTandaPdf(week, data, feriados, paper: _paper),
-                          onStart: () =>
-                              setState(() => _isPrintingTanda = true),
-                          onEnd: () =>
-                              setState(() => _isPrintingTanda = false),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _ModeButton(
+                        label: widget.controller.destination == 'Coyhaique'
+                            ? 'Coyhaique'
+                            : 'Aysén',
+                        selected: widget.controller.destination == 'Coyhaique',
+                        onTap: () => widget.controller.setDestination(
+                          widget.controller.destination == 'Coyhaique'
+                              ? 'Aysen'
+                              : 'Coyhaique',
                         ),
+                      ),
+                    ),
+                  ],
                 ),
                 const SizedBox(height: 16),
-                // ── TODO list de días ──
+                // ── Navegador de días ──
                 const Text(
                   'Planillas por día',
                   style: TextStyle(
@@ -470,332 +482,101 @@ class _TandaPanelState extends State<TandaPanel> {
     final feriadoTodo = feriados[_dateKey(date)];
     final isFeriado = feriadoTodo != null;
     final isIrrenunciable = feriadoTodo?.irrenunciable == true;
-    final effectiveWd = isIrrenunciable && wd < 7 ? 7 : wd;
+    final effectiveWd = _effectiveWeekday(date, feriados);
     final ac = _accent(effectiveWd);
     final lt = _light(effectiveWd);
-    final done = _printedDays.contains(idx);
+    final done = widget.controller.printedDays.contains(idx);
+    final activeDay = widget.controller.dayNotifier.value;
+    final active = activeDay != null && _dateKey(activeDay) == _dateKey(date);
 
-    return Container(
-      margin: const EdgeInsets.only(bottom: 5),
-      decoration: BoxDecoration(
-        color: done ? lt : Colors.white,
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(
-          color: done ? ac : const Color(0xFFDDDDDD),
-          width: done ? 1.5 : 1,
-        ),
-      ),
-      child: Row(
-        children: [
-          // ── Check / círculo ──
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 200),
-              width: 20,
-              height: 20,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: done ? ac : Colors.transparent,
-                border: Border.all(
-                  color: done ? ac : Colors.black26,
-                  width: 1.5,
-                ),
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: () => widget.controller.dayNotifier.value = date,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 150),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
+            decoration: BoxDecoration(
+              color: done ? lt : Colors.white,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: active
+                    ? ac
+                    : (done ? ac : const Color(0xFFDDDDDD)),
+                width: active ? 2 : (done ? 1.5 : 1),
               ),
-              child: done
-                  ? const Icon(Icons.check, size: 12, color: Colors.white)
+              boxShadow: active
+                  ? [
+                      BoxShadow(
+                        color: ac.withAlpha(70),
+                        blurRadius: 8,
+                        offset: const Offset(0, 2),
+                      ),
+                    ]
                   : null,
             ),
-          ),
-          // ── Nombre del día + fecha ──
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
+            child: Row(
               children: [
-                Text(
-                  '${_shortNames[wd - 1]}  ${_fmt(date)}'
-                  '${isIrrenunciable ? '  ·  Feriado' : isFeriado ? '  ·  F. Renunciable' : ''}',
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700,
-                    color: done ? ac : Colors.black87,
-                    decoration: done ? TextDecoration.lineThrough : null,
-                    decorationColor: ac,
+                // ── Check / círculo ──
+                AnimatedContainer(
+                  duration: const Duration(milliseconds: 200),
+                  width: 22,
+                  height: 22,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: done ? ac : Colors.transparent,
+                    border: Border.all(
+                      color: done ? ac : Colors.black26,
+                      width: 1.5,
+                    ),
+                  ),
+                  child: done
+                      ? const Icon(Icons.check, size: 13, color: Colors.white)
+                      : null,
+                ),
+                const SizedBox(width: 10),
+                // ── Nombre del día + fecha ──
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        '${_shortNames[wd - 1]}  ${_fmt(date)}'
+                        '${isIrrenunciable ? '  ·  Feriado' : isFeriado ? '  ·  F. Renunciable' : ''}',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                          color: active || done ? ac : Colors.black87,
+                        ),
+                      ),
+                      Text(
+                        times.isEmpty
+                            ? 'Sin horarios'
+                            : '${times.length} horario${times.length == 1 ? '' : 's'}',
+                        style: TextStyle(
+                          fontSize: 10.5,
+                          color: times.isEmpty
+                              ? Colors.black26
+                              : ac.withAlpha(180),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-                Text(
-                  times.isEmpty
-                      ? 'Sin horarios'
-                      : '${times.length} horario${times.length == 1 ? '' : 's'}',
-                  style: TextStyle(
-                    fontSize: 10,
-                    color: times.isEmpty ? Colors.black26 : ac.withAlpha(180),
-                  ),
+                Icon(
+                  Icons.chevron_right_rounded,
+                  size: 20,
+                  color: active ? ac : Colors.black26,
                 ),
               ],
             ),
           ),
-          // ── Botones imprimir ──
-          if (times.isNotEmpty) ...[
-            IconButton(
-              tooltip: done ? 'Reimprimir' : 'Imprimir',
-              icon: _printingDays.contains(idx)
-                  ? const SizedBox(
-                      width: 14,
-                      height: 14,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 1.5,
-                        color: Colors.grey,
-                      ),
-                    )
-                  : Icon(
-                      done ? Icons.replay_rounded : Icons.print_rounded,
-                      size: 18,
-                      color: done ? ac.withAlpha(160) : ac,
-                    ),
-              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-              padding: EdgeInsets.zero,
-              onPressed: _printingDays.contains(idx)
-                  ? null
-                  : () => _guardedPrint(
-                      printFn: () => printDiaPdf(
-                        date,
-                        data,
-                        feriados,
-                        _dayDestination,
-                        paper: _paper,
-                      ),
-                      onStart: () => setState(() => _printingDays.add(idx)),
-                      onEnd: () {
-                        setState(() {
-                          _printingDays.remove(idx);
-                          _printedDays.add(idx);
-                        });
-                        _saveProgress();
-                      },
-                    ),
-            ),
-            if (times.length > 1)
-              Padding(
-                padding: const EdgeInsets.only(right: 4),
-                child: IconButton(
-                  tooltip: 'Seleccionar horarios',
-                  icon: Icon(
-                    Icons.more_vert,
-                    size: 18,
-                    color: _printingDays.contains(idx)
-                        ? Colors.black26
-                        : Colors.black45,
-                  ),
-                  constraints:
-                      const BoxConstraints(minWidth: 28, minHeight: 32),
-                  padding: EdgeInsets.zero,
-                  onPressed: _printingDays.contains(idx)
-                      ? null
-                      : () => _showSelectAndPrint(
-                          context,
-                          date,
-                          data,
-                          feriados,
-                          idx: idx,
-                          onStart: () =>
-                              setState(() => _printingDays.add(idx)),
-                          onEnd: () {
-                            setState(() {
-                              _printingDays.remove(idx);
-                              _printedDays.add(idx);
-                            });
-                            _saveProgress();
-                          },
-                        ),
-                ),
-              ),
-          ] else
-            const SizedBox(width: 44),
-        ],
+        ),
       ),
-    );
-  }
-
-  Widget _buildDiaInfo() {
-    return ListenableBuilder(
-      listenable: Listenable.merge([
-        widget.dayNotifier,
-        widget.horariosNotifier,
-        widget.feriadosNotifier,
-      ]),
-      builder: (_, _) {
-        final day = widget.dayNotifier.value;
-        if (day == null) return const SizedBox.shrink();
-        final feriados = widget.feriadosNotifier.value;
-        final feriadoDia = feriados[_dateKey(day)];
-        final isIrrenunciableDia = feriadoDia?.irrenunciable == true;
-        final wd = isIrrenunciableDia && day.weekday < 7 ? 7 : day.weekday;
-        final times = _timesForDate(
-          day,
-          widget.horariosNotifier.value,
-          feriados,
-        );
-        final ac = _accent(wd);
-        final bo = _border(wd);
-        final dayLabel = isIrrenunciableDia
-            ? 'Feriado Irrenunciable'
-            : feriadoDia != null
-            ? 'Feriado Renunciable'
-            : _longNames[day.weekday - 1];
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: _light(wd),
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: bo),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    dayLabel,
-                    style: TextStyle(
-                      fontSize: 10,
-                      color: ac,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    _fmtFull(day),
-                    style: const TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                  Text(
-                    '${times.length} horario${times.length == 1 ? '' : 's'}',
-                    style: TextStyle(fontSize: 11, color: ac.withAlpha(180)),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 8),
-            // ── Destino ──
-            Row(
-              children: [
-                const Text(
-                  'Destino:',
-                  style: TextStyle(fontSize: 11, color: Colors.black54),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: _ModeButton(
-                    label: _dayDestination == 'Coyhaique'
-                        ? 'Coyhaique'
-                        : 'Aysén',
-                    selected: _dayDestination == 'Coyhaique',
-                    onTap: () {
-                      setState(
-                        () => _dayDestination = _dayDestination == 'Coyhaique'
-                            ? 'Aysen'
-                            : 'Coyhaique',
-                      );
-                      _saveProgress();
-                    },
-                    color: ac,
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: _isPrintingDia ? ac.withAlpha(160) : ac,
-                      foregroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(6),
-                      ),
-                      padding: const EdgeInsets.symmetric(vertical: 11),
-                      elevation: 0,
-                    ),
-                    icon: _isPrintingDia
-                        ? const SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
-                              color: Colors.white,
-                            ),
-                          )
-                        : const Icon(Icons.print_rounded, size: 16),
-                    label: Text(
-                      _isPrintingDia
-                          ? 'Imprimiendo…'
-                          : 'Imprimir ${times.length} planilla${times.length == 1 ? '' : 's'}',
-                      style: const TextStyle(
-                        fontWeight: FontWeight.w700,
-                        fontSize: 13,
-                      ),
-                    ),
-                    onPressed: (times.isEmpty || _isPrintingDia)
-                        ? null
-                        : () => _guardedPrint(
-                            printFn: () => printDiaPdf(
-                              day,
-                              widget.horariosNotifier.value,
-                              feriados,
-                              _dayDestination,
-                              paper: _paper,
-                            ),
-                            onStart: () =>
-                                setState(() => _isPrintingDia = true),
-                            onEnd: () =>
-                                setState(() => _isPrintingDia = false),
-                          ),
-                  ),
-                ),
-                if (times.length > 1) ...[
-                  const SizedBox(width: 6),
-                  SizedBox(
-                    height: 44,
-                    child: OutlinedButton(
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor:
-                            _isPrintingDia ? Colors.black26 : ac,
-                        side: BorderSide(
-                          color: _isPrintingDia ? Colors.black12 : bo,
-                        ),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(6),
-                        ),
-                        padding: EdgeInsets.zero,
-                        minimumSize: const Size(40, 44),
-                      ),
-                      onPressed: _isPrintingDia
-                          ? null
-                          : () => _showSelectAndPrint(
-                              context,
-                              day,
-                              widget.horariosNotifier.value,
-                              feriados,
-                              onStart: () =>
-                                  setState(() => _isPrintingDia = true),
-                              onEnd: () =>
-                                  setState(() => _isPrintingDia = false),
-                            ),
-                      child: const Icon(Icons.more_vert, size: 20),
-                    ),
-                  ),
-                ],
-              ],
-            ),
-          ],
-        );
-      },
     );
   }
 
@@ -887,21 +668,19 @@ class _TandaPanelState extends State<TandaPanel> {
           // ── Grilla ──
           ListenableBuilder(
             listenable: Listenable.merge([
-              widget.feriadosNotifier,
-              widget.weekNotifier,
-              widget.dayNotifier,
-              widget.modeNotifier,
+              widget.controller.feriadosNotifier,
+              widget.controller.weekNotifier,
+              widget.controller.dayNotifier,
             ]),
             builder: (_, _) => Padding(
               padding: const EdgeInsets.only(bottom: 6, left: 2, right: 2),
               child: _buildGrid(
                 offset,
                 daysInMonth,
-                widget.weekNotifier.value,
-                widget.dayNotifier.value,
-                widget.modeNotifier.value,
+                widget.controller.weekNotifier.value,
+                widget.controller.dayNotifier.value,
                 today,
-                widget.feriadosNotifier.value,
+                widget.controller.feriadosNotifier.value,
               ),
             ),
           ),
@@ -915,7 +694,6 @@ class _TandaPanelState extends State<TandaPanel> {
     int daysInMonth,
     DateTime? selectedWeek,
     DateTime? selectedDay,
-    TandaMode mode,
     DateTime today,
     Map<String, Feriado> feriadosMap,
   ) {
@@ -943,13 +721,11 @@ class _TandaPanelState extends State<TandaPanel> {
                       final isIrrenunciableCal = feriadoCal?.irrenunciable == true;
                       final effectiveWd = isIrrenunciableCal && wd < 7 ? 7 : wd;
                       final inBand =
-                          mode == TandaMode.semana &&
                           selectedWeek != null &&
                           ws.year == selectedWeek.year &&
                           ws.month == selectedWeek.month &&
                           ws.day == selectedWeek.day;
                       final isSelectedDay =
-                          mode == TandaMode.dia &&
                           selectedDay != null &&
                           date.year == selectedDay.year &&
                           date.month == selectedDay.month &&
@@ -969,11 +745,8 @@ class _TandaPanelState extends State<TandaPanel> {
 
                       return GestureDetector(
                         onTap: () {
-                          if (mode == TandaMode.dia) {
-                            widget.dayNotifier.value = date;
-                          } else {
-                            widget.weekNotifier.value = ws;
-                          }
+                          widget.controller.weekNotifier.value = ws;
+                          widget.controller.dayNotifier.value = date;
                         },
                         child: Container(
                           height: 30,
@@ -1058,453 +831,378 @@ class _TandaPanelState extends State<TandaPanel> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TandaViewer — vista de la semana (panel derecho)
+// TandaViewer — workspace de impresión día-a-día (panel derecho)
 // ─────────────────────────────────────────────────────────────────────────────
 class TandaViewer extends StatelessWidget {
-  final ValueNotifier<DateTime?> weekNotifier;
-  final ValueNotifier<HorariosData> horariosNotifier;
-  final ValueNotifier<Map<String, Feriado>> feriadosNotifier;
-  final ValueNotifier<TandaMode> modeNotifier;
-  final ValueNotifier<DateTime?> dayNotifier;
+  final TandaController controller;
 
-  const TandaViewer({
-    super.key,
-    required this.weekNotifier,
-    required this.horariosNotifier,
-    required this.feriadosNotifier,
-    required this.modeNotifier,
-    required this.dayNotifier,
-  });
+  const TandaViewer({super.key, required this.controller});
 
   @override
   Widget build(BuildContext context) {
     return Container(
       color: const Color(0xFFE8E8E8),
-      child: ValueListenableBuilder<TandaMode>(
-        valueListenable: modeNotifier,
-        builder: (_, mode, _) {
-          if (mode == TandaMode.dia) {
-            return ValueListenableBuilder<DateTime?>(
-              valueListenable: dayNotifier,
-              builder: (_, day, _) {
-                if (day == null) {
-                  return const Center(
-                    child: Text(
-                      'Selecciona un día en el panel izquierdo',
-                      style: TextStyle(color: Colors.black38, fontSize: 14),
-                    ),
-                  );
-                }
-                return ValueListenableBuilder<HorariosData>(
-                  valueListenable: horariosNotifier,
-                  builder: (_, data, _) =>
-                      ValueListenableBuilder<Map<String, Feriado>>(
-                        valueListenable: feriadosNotifier,
-                        builder: (_, feriados, _) =>
-                            _buildDaySingle(day, data, feriados),
-                      ),
-                );
-              },
+      child: ListenableBuilder(
+        listenable: Listenable.merge([
+          controller,
+          controller.weekNotifier,
+          controller.dayNotifier,
+          controller.horariosNotifier,
+          controller.feriadosNotifier,
+        ]),
+        builder: (_, _) {
+          final week = controller.weekNotifier.value;
+          if (week == null) {
+            return const Center(
+              child: Text(
+                'Selecciona una semana en el panel izquierdo',
+                style: TextStyle(color: Colors.black38, fontSize: 14),
+              ),
             );
           }
-          // ── SEMANA mode ──
-          return ValueListenableBuilder<Map<String, Feriado>>(
-            valueListenable: feriadosNotifier,
-            builder: (_, feriados, _) => ValueListenableBuilder<DateTime?>(
-              valueListenable: weekNotifier,
-              builder: (_, week, _) {
-                if (week == null) {
-                  return const Center(
-                    child: Text(
-                      'Selecciona una semana en el panel izquierdo',
-                      style: TextStyle(color: Colors.black38, fontSize: 14),
-                    ),
-                  );
-                }
-                return ValueListenableBuilder<HorariosData>(
-                  valueListenable: horariosNotifier,
-                  builder: (_, data, _) => _buildWeek(week, data, feriados),
-                );
-              },
-            ),
+          final day = controller.dayNotifier.value ?? week;
+          final data = controller.horariosNotifier.value;
+          final feriados = controller.feriadosNotifier.value;
+          final idx = day.weekday - 1; // 0..6, Lunes-based
+
+          return Column(
+            children: [
+              _buildHeader(day, feriados),
+              _buildDayNav(week, day, idx, feriados),
+              Expanded(
+                child: _DayWorkspace(
+                  key: ValueKey(_dateKey(day)),
+                  date: day,
+                  idx: idx,
+                  data: data,
+                  feriados: feriados,
+                  controller: controller,
+                ),
+              ),
+            ],
           );
         },
       ),
     );
   }
 
-  Widget _buildDaySingle(
-    DateTime day,
-    HorariosData data,
-    Map<String, Feriado> feriados,
-  ) {
-    final feriadoSingle = feriados[_dateKey(day)];
+  Widget _buildHeader(DateTime day, Map<String, Feriado> feriados) {
+    final feriadoDia = feriados[_dateKey(day)];
     final wd = day.weekday;
-    final feriadoNombre = feriadoSingle?.nombre;
-    return Column(
-      children: [
-        Container(
-          color: _kHeaderDark,
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-          child: Row(
-            children: [
-              const Icon(
-                Icons.calendar_today_outlined,
-                color: Colors.white60,
-                size: 16,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  '${_longNames[wd - 1]}  —  ${_fmtFull(day)}'
-                  '${feriadoNombre != null ? '  ·  $feriadoNombre' : ''}',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ),
-            ],
+    final feriadoNombre = feriadoDia?.nombre;
+    return Container(
+      color: _kHeaderDark,
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+      child: Row(
+        children: [
+          const Icon(
+            Icons.calendar_today_outlined,
+            color: Colors.white60,
+            size: 16,
           ),
-        ),
-        Expanded(
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 280),
-                child: _DayColumn(date: day, data: data, feriados: feriados),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '${_longNames[wd - 1]}  —  ${_fmtFull(day)}'
+              '${feriadoNombre != null ? '  ·  $feriadoNombre' : ''}',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: FontWeight.w700,
               ),
             ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 
-  Widget _buildWeek(
+  Widget _buildDayNav(
     DateTime week,
-    HorariosData data,
+    DateTime day,
+    int idx,
     Map<String, Feriado> feriados,
   ) {
-    final end = week.add(const Duration(days: 6));
-    return Column(
-      children: [
-        // ── Encabezado ──
-        Container(
-          color: _kHeaderDark,
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-          child: Row(
-            children: [
-              const Icon(
-                Icons.view_week_outlined,
-                color: Colors.white60,
-                size: 16,
-              ),
-              const SizedBox(width: 8),
-              Text(
-                'Semana del ${_fmtFull(week)} al ${_fmtFull(end)}',
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ],
+    return Container(
+      color: Colors.white,
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+      child: Row(
+        children: [
+          IconButton(
+            tooltip: 'Día anterior',
+            icon: const Icon(Icons.chevron_left),
+            onPressed: idx > 0
+                ? () => controller.dayNotifier.value =
+                      day.subtract(const Duration(days: 1))
+                : null,
           ),
-        ),
-        // ── 7 columnas ──
-        Expanded(
-          child: Padding(
-            padding: const EdgeInsets.all(14),
+          Expanded(
             child: Row(
               children: [
                 for (int i = 0; i < 7; i++) ...[
-                  if (i > 0) const SizedBox(width: 8),
+                  if (i > 0) const SizedBox(width: 4),
                   Expanded(
-                    child: _DayColumn(
+                    child: _DayTab(
                       date: week.add(Duration(days: i)),
-                      data: data,
+                      selected: i == idx,
+                      done: controller.printedDays.contains(i),
                       feriados: feriados,
+                      onTap: () => controller.dayNotifier.value =
+                          week.add(Duration(days: i)),
                     ),
                   ),
                 ],
               ],
             ),
           ),
-        ),
-      ],
+          IconButton(
+            tooltip: 'Día siguiente',
+            icon: const Icon(Icons.chevron_right),
+            onPressed: idx < 6
+                ? () => controller.dayNotifier.value =
+                      day.add(const Duration(days: 1))
+                : null,
+          ),
+        ],
+      ),
     );
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// _DayColumn
+// _DayTab — pestaña de día (Lu-Ma-Mi-Ju-Vi-Sá-Do) en el panel derecho
 // ─────────────────────────────────────────────────────────────────────────────
-class _DayColumn extends StatelessWidget {
+class _DayTab extends StatelessWidget {
   final DateTime date;
-  final HorariosData data;
+  final bool selected;
+  final bool done;
   final Map<String, Feriado> feriados;
+  final VoidCallback onTap;
 
-  const _DayColumn({
+  const _DayTab({
     required this.date,
-    required this.data,
+    required this.selected,
+    required this.done,
     required this.feriados,
+    required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    final wd = date.weekday;
-    final feriadoObj = feriados[_dateKey(date)];
-    final isIrrenunciable = feriadoObj?.irrenunciable == true;
-    final colorWd = (isIrrenunciable && wd < 7) ? 7 : wd;
-    final ac = _accent(colorWd);
-    final lt = _light(colorWd);
-    final bo = _border(colorWd);
-    final dk = _dark(colorWd);
-    final tl = _timesForDate(date, data, feriados);
-    final feriadoNombre = feriadoObj?.nombre;
-
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: bo, width: 1.5),
-        boxShadow: [
-          BoxShadow(
-            color: ac.withAlpha(20),
-            blurRadius: 6,
-            offset: const Offset(0, 2),
+    final wd = _effectiveWeekday(date, feriados);
+    final ac = _accent(wd);
+    final lt = _light(wd);
+    final bo = _border(wd);
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        decoration: BoxDecoration(
+          color: selected ? ac : (done ? lt : Colors.transparent),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
+            color: selected ? ac : (done ? bo : Colors.black12),
+            width: selected ? 0 : 1,
           ),
-        ],
-      ),
-      child: Column(
-        children: [
-          // ── Cabecera del día ──
-          Container(
-            padding: const EdgeInsets.symmetric(vertical: 8),
-            decoration: BoxDecoration(
-              color: ac,
-              borderRadius: const BorderRadius.vertical(
-                top: Radius.circular(7),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              _shortNames[date.weekday - 1],
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                color: selected ? Colors.white : (done ? ac : Colors.black54),
               ),
             ),
-            child: Column(
-              children: [
-                Text(
-                  _longNames[wd - 1],
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-                Text(
-                  _fmt(date),
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                    color: Colors.white.withAlpha(200),
-                    fontSize: 10,
-                  ),
-                ),
-                if (feriadoNombre != null)
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 4),
-                    child: Text(
-                      feriadoNombre,
-                      textAlign: TextAlign.center,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: Colors.white.withAlpha(210),
-                        fontSize: 8,
-                        fontStyle: FontStyle.italic,
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          // ── Lista de horarios ──
-          if (tl.isEmpty)
-            Expanded(
-              child: Center(
-                child: Text(
-                  '–',
-                  style: TextStyle(color: ac.withAlpha(80), fontSize: 20),
-                ),
-              ),
-            )
-          else
-            Expanded(
-              child: ListView.builder(
-                padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
-                itemCount: tl.length,
-                itemBuilder: (_, i) => Container(
-                  margin: const EdgeInsets.only(bottom: 4),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 4,
-                    vertical: 5,
-                  ),
-                  decoration: BoxDecoration(
-                    color: lt,
-                    borderRadius: BorderRadius.circular(4),
-                    border: Border.all(color: bo),
-                  ),
-                  child: Text(
-                    tl[i],
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700,
-                      color: dk,
-                      letterSpacing: 0.5,
-                    ),
-                  ),
-                ),
+            Text(
+              _fmt(date),
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 9,
+                color: selected ? Colors.white70 : Colors.black38,
               ),
             ),
-        ],
+            SizedBox(
+              height: 11,
+              child: done
+                  ? Icon(
+                      Icons.check_circle,
+                      size: 10,
+                      color: selected ? Colors.white : ac,
+                    )
+                  : null,
+            ),
+          ],
+        ),
       ),
     );
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PDF printing
+// _DayWorkspace — checklist de horarios + botón de imprimir para el día activo
 // ─────────────────────────────────────────────────────────────────────────────
-Future<void> printTandaPdf(
-  DateTime week,
-  HorariosData data,
-  Map<String, Feriado> feriados, {
-  PaperSize paper = PaperSize.a4,
-}) async {
-  final font = pw.Font.helvetica();
-  final bold = pw.Font.helveticaBold();
+class _DayWorkspace extends StatefulWidget {
+  final DateTime date;
+  final int idx;
+  final HorariosData data;
+  final Map<String, Feriado> feriados;
+  final TandaController controller;
 
-  final doc = pw.Document();
-  doc.addPage(
-    pw.Page(
-      pageFormat: paper.pdfFormat.landscape,
-      margin: const pw.EdgeInsets.all(24),
-      build: (ctx) => pw.Column(
-        crossAxisAlignment: pw.CrossAxisAlignment.start,
-        children: [
-          pw.Text(
-            'Tanda de Horarios  •  ${_fmt(week)} – ${_fmt(week.add(const Duration(days: 6)))}',
-            style: pw.TextStyle(font: bold, fontSize: 13),
-          ),
-          pw.SizedBox(height: 10),
-          pw.Expanded(
-            child: pw.Row(
-              crossAxisAlignment: pw.CrossAxisAlignment.start,
-              children: [
-                for (int i = 0; i < 7; i++) ...[
-                  if (i > 0) pw.SizedBox(width: 6),
-                  pw.Expanded(
-                    child: _pdfDayCol(
-                      week.add(Duration(days: i)),
-                      data,
-                      feriados,
-                      font,
-                      bold,
-                    ),
-                  ),
-                ],
-              ],
-            ),
-          ),
-        ],
-      ),
-    ),
-  );
-  await Printing.layoutPdf(onLayout: (_) => doc.save());
+  const _DayWorkspace({
+    super.key,
+    required this.date,
+    required this.idx,
+    required this.data,
+    required this.feriados,
+    required this.controller,
+  });
+
+  @override
+  State<_DayWorkspace> createState() => _DayWorkspaceState();
 }
 
-pw.Widget _pdfDayCol(
-  DateTime date,
-  HorariosData data,
-  Map<String, Feriado> feriados,
-  pw.Font font,
-  pw.Font bold,
-) {
-  final wd = date.weekday;
-  final feriadoPdf = feriados[_dateKey(date)];
-  final isIrrenunciablePdf = feriadoPdf?.irrenunciable == true;
-  final tl = _timesForDate(date, data, feriados);
-  final colorWd = (isIrrenunciablePdf && wd < 7) ? 7 : wd;
-  final headerBg = colorWd <= 5
-      ? const PdfColor(0.208, 0.369, 0.231) // #355E3B
-      : colorWd == 6
-      ? const PdfColor(0.478, 0.361, 0.078) // #7A5C14
-      : const PdfColor(0.482, 0.122, 0.180); // #7B1F2E
+class _DayWorkspaceState extends State<_DayWorkspace> {
+  late List<bool> _selected;
 
-  return pw.Container(
-    decoration: pw.BoxDecoration(
-      border: pw.Border.all(color: PdfColors.grey300, width: 0.5),
-      borderRadius: pw.BorderRadius.circular(3),
-    ),
-    child: pw.Column(
-      crossAxisAlignment: pw.CrossAxisAlignment.stretch,
-      children: [
-        pw.Container(
-          padding: const pw.EdgeInsets.symmetric(vertical: 5),
-          color: headerBg,
-          child: pw.Column(
+  @override
+  void initState() {
+    super.initState();
+    final times = _timesForDate(widget.date, widget.data, widget.feriados);
+    _selected = List.filled(times.length, true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final times = _timesForDate(widget.date, widget.data, widget.feriados);
+    if (_selected.length != times.length) {
+      _selected = List.filled(times.length, true);
+    }
+    final wd = _effectiveWeekday(widget.date, widget.feriados);
+    final ac = _accent(wd);
+    final bo = _border(wd);
+
+    if (times.isEmpty) {
+      return const Center(
+        child: Text(
+          'Sin horarios para este día',
+          style: TextStyle(color: Colors.black38, fontSize: 14),
+        ),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.all(24),
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 380),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              pw.Text(
-                _pdfNames[wd - 1],
-                textAlign: pw.TextAlign.center,
-                style: pw.TextStyle(
-                  font: bold,
-                  fontSize: 8,
-                  color: PdfColors.white,
+              const Text(
+                'Horarios a imprimir',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.black45,
+                  letterSpacing: 0.5,
                 ),
               ),
-              pw.Text(
-                _fmt(date),
-                textAlign: pw.TextAlign.center,
-                style: pw.TextStyle(
-                  font: font,
-                  fontSize: 7,
-                  color: PdfColors.white,
+              const SizedBox(height: 8),
+              Expanded(
+                child: Material(
+                  color: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    side: BorderSide(color: bo),
+                  ),
+                  clipBehavior: Clip.antiAlias,
+                  child: ListView.separated(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    itemCount: times.length,
+                    separatorBuilder: (_, _) =>
+                        Divider(height: 1, color: bo.withAlpha(130)),
+                    itemBuilder: (_, i) => CheckboxListTile(
+                      dense: true,
+                      activeColor: ac,
+                      controlAffinity: ListTileControlAffinity.leading,
+                      value: _selected[i],
+                      onChanged: (v) =>
+                          setState(() => _selected[i] = v ?? false),
+                      title: Text(
+                        times[i],
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ),
                 ),
+              ),
+              const SizedBox(height: 14),
+              AnimatedBuilder(
+                animation: widget.controller,
+                builder: (_, _) {
+                  final checkedCount = _selected.where((s) => s).length;
+                  final isPrinting = widget.controller.isPrinting;
+                  return ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: isPrinting ? ac.withAlpha(160) : ac,
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      padding: const EdgeInsets.symmetric(vertical: 13),
+                      elevation: 0,
+                    ),
+                    icon: isPrinting
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          )
+                        : const Icon(Icons.print_rounded, size: 18),
+                    label: Text(
+                      isPrinting
+                          ? 'Imprimiendo…'
+                          : 'Imprimir $checkedCount planilla${checkedCount == 1 ? '' : 's'}',
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 14,
+                      ),
+                    ),
+                    onPressed: (checkedCount == 0 || isPrinting)
+                        ? null
+                        : () {
+                            final chosen = [
+                              for (int i = 0; i < times.length; i++)
+                                if (_selected[i]) times[i],
+                            ];
+                            widget.controller.printDay(
+                              date: widget.date,
+                              idxInWeek: widget.idx,
+                              data: widget.data,
+                              feriados: widget.feriados,
+                              selectedTimes: chosen,
+                            );
+                          },
+                  );
+                },
               ),
             ],
           ),
         ),
-        if (tl.isEmpty)
-          pw.Padding(
-            padding: const pw.EdgeInsets.all(6),
-            child: pw.Text(
-              '-',
-              textAlign: pw.TextAlign.center,
-              style: pw.TextStyle(
-                font: font,
-                fontSize: 9,
-                color: PdfColors.grey400,
-              ),
-            ),
-          )
-        else
-          ...tl.map(
-            (t) => pw.Padding(
-              padding: const pw.EdgeInsets.symmetric(
-                vertical: 3,
-                horizontal: 4,
-              ),
-              child: pw.Text(
-                t,
-                textAlign: pw.TextAlign.center,
-                style: pw.TextStyle(font: bold, fontSize: 10),
-              ),
-            ),
-          ),
-      ],
-    ),
-  );
+      ),
+    );
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1561,126 +1259,22 @@ Future<void> printDiaPdf(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// _SelectTimesDialog — elige qué horarios de un día imprimir
-// ─────────────────────────────────────────────────────────────────────────────
-class _SelectTimesDialog extends StatefulWidget {
-  final List<String> times;
-  final DateTime date;
-
-  const _SelectTimesDialog({required this.times, required this.date});
-
-  @override
-  State<_SelectTimesDialog> createState() => _SelectTimesDialogState();
-}
-
-class _SelectTimesDialogState extends State<_SelectTimesDialog> {
-  late final List<bool> _selected;
-
-  @override
-  void initState() {
-    super.initState();
-    _selected = List.filled(widget.times.length, true);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final count = _selected.where((s) => s).length;
-    return AlertDialog(
-      title: const Text('Seleccionar horarios'),
-      titleTextStyle: const TextStyle(
-        fontSize: 15,
-        fontWeight: FontWeight.w700,
-        color: Colors.black87,
-      ),
-      contentPadding: const EdgeInsets.fromLTRB(0, 12, 0, 0),
-      content: SizedBox(
-        width: 280,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 20),
-              child: Text(
-                _fmtFull(widget.date),
-                style: const TextStyle(fontSize: 12, color: Colors.black54),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Flexible(
-              child: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    for (int i = 0; i < widget.times.length; i++)
-                      CheckboxListTile(
-                        dense: true,
-                        title: Text(
-                          widget.times[i],
-                          style: const TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                        value: _selected[i],
-                        onChanged: (v) =>
-                            setState(() => _selected[i] = v ?? false),
-                        controlAffinity: ListTileControlAffinity.leading,
-                      ),
-                  ],
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-      actionsPadding:
-          const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Cancelar'),
-        ),
-        FilledButton(
-          onPressed: count == 0
-              ? null
-              : () {
-                  final result = [
-                    for (int i = 0; i < widget.times.length; i++)
-                      if (_selected[i]) widget.times[i],
-                  ];
-                  Navigator.pop(context, result);
-                },
-          child: Text(
-            count == 0
-                ? 'Imprimir'
-                : 'Imprimir $count planilla${count == 1 ? '' : 's'}',
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// _ModeButton — botón de toggle para DIA / SEMANA
+// _ModeButton — botón de toggle (usado hoy para el selector de Destino)
 // ─────────────────────────────────────────────────────────────────────────────
 class _ModeButton extends StatelessWidget {
   final String label;
   final bool selected;
   final VoidCallback onTap;
-  final Color? color;
 
   const _ModeButton({
     required this.label,
     required this.selected,
     required this.onTap,
-    this.color,
   });
 
   @override
   Widget build(BuildContext context) {
-    final ac = color ?? _kHeaderDark;
+    const ac = _kHeaderDark;
     return GestureDetector(
       onTap: onTap,
       child: AnimatedContainer(

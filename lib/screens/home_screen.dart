@@ -3,12 +3,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:printing/printing.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/feriado.dart';
 import '../models/paper_size.dart';
 import '../painters/planilla_painter.dart';
 import '../services/pdf_cache_service.dart';
 import 'horarios_dialog.dart';
 import 'tanda_screen.dart';
+
+const _kKeyPlanillaPaperSize = 'planilla_paper_size';
 
 const _kBlue = Color(0xFF7B1F2E);
 const _kHunterGreen = Color(0xFF355E3B);
@@ -40,9 +43,9 @@ class _HomeScreenState extends State<HomeScreen> {
   final _zoomNotifier = ValueNotifier<double>(1.0);
   final _tandaWeekNotifier = ValueNotifier<DateTime?>(null);
   final _tandaDayNotifier = ValueNotifier<DateTime?>(null);
-  final _tandaModeNotifier = ValueNotifier<TandaMode>(TandaMode.semana);
   final _feriadosTandaNotifier = ValueNotifier<Map<String, Feriado>>({});
   late final ValueNotifier<HorariosData> _horariosNotifier;
+  late final TandaController _tandaController;
 
   void _onHorariosChanged(HorariosData data) {
     _horariosNotifier.value = data;
@@ -55,9 +58,32 @@ class _HomeScreenState extends State<HomeScreen> {
       widget.initialHorarios ??
           const HorariosData(lunesViernes: [], sabado: [], domingoFeriado: []),
     );
+    _tandaController = TandaController(
+      horariosNotifier: _horariosNotifier,
+      feriadosNotifier: _feriadosTandaNotifier,
+      weekNotifier: _tandaWeekNotifier,
+      dayNotifier: _tandaDayNotifier,
+    );
     _transform = TransformationController();
     _pdfCache = PdfCacheService()..attach(_capturePng);
     Future.microtask(() => _invalidateCache());
+    _loadPaperSize();
+  }
+
+  Future<void> _loadPaperSize() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_kKeyPlanillaPaperSize);
+    if (raw == null || !mounted) return;
+    setState(() => _paper = raw == 'carta' ? PaperSize.carta : PaperSize.a4);
+    _invalidateCache();
+  }
+
+  Future<void> _savePaperSize() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _kKeyPlanillaPaperSize,
+      _paper == PaperSize.a4 ? 'a4' : 'carta',
+    );
   }
 
   @override
@@ -65,9 +91,9 @@ class _HomeScreenState extends State<HomeScreen> {
     _transform.dispose();
     _pdfCache.dispose();
     _zoomNotifier.dispose();
+    _tandaController.dispose();
     _tandaWeekNotifier.dispose();
     _tandaDayNotifier.dispose();
-    _tandaModeNotifier.dispose();
     _horariosNotifier.dispose();
     _feriadosTandaNotifier.dispose();
     super.dispose();
@@ -157,6 +183,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         onPaperChanged: (p) {
                           setState(() => _paper = p);
                           _invalidateCache();
+                          _savePaperSize();
                         },
                         onZoom: _setZoom,
                         onDestinationChanged: (d) {
@@ -175,13 +202,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     )
                   else if (_view == _AppView.tanda)
                     Expanded(
-                      child: TandaPanel(
-                        weekNotifier: _tandaWeekNotifier,
-                        horariosNotifier: _horariosNotifier,
-                        feriadosNotifier: _feriadosTandaNotifier,
-                        modeNotifier: _tandaModeNotifier,
-                        dayNotifier: _tandaDayNotifier,
-                      ),
+                      child: TandaPanel(controller: _tandaController),
                     )
                   else
                     Expanded(
@@ -215,13 +236,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 date: _date,
                 repaintKey: _repaintKey,
               ),
-              _AppView.tanda => TandaViewer(
-                weekNotifier: _tandaWeekNotifier,
-                horariosNotifier: _horariosNotifier,
-                feriadosNotifier: _feriadosTandaNotifier,
-                modeNotifier: _tandaModeNotifier,
-                dayNotifier: _tandaDayNotifier,
-              ),
+              _AppView.tanda => TandaViewer(controller: _tandaController),
               _AppView.horarios => HorariosViewer(
                 dataNotifier: _horariosNotifier,
               ),
