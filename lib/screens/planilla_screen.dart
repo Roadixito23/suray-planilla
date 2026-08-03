@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
+import '../models/paper_size.dart';
 import '../painters/planilla_painter.dart';
-import 'home_screen.dart';
 
 class PlanillaScreen extends StatefulWidget {
   final PaperSize paperSize;
