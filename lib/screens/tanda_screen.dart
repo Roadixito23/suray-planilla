@@ -1,13 +1,15 @@
 import 'dart:convert';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/material.dart';
-import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/feriado.dart';
 import '../models/paper_size.dart';
 import '../painters/planilla_painter.dart';
 import '../services/feriados_service.dart';
+import '../services/tanda_pdf_cache_service.dart';
 import 'horarios_dialog.dart';
 
 // ── Claves de SharedPreferences (avance de Tanda) ──────────────────────────────
@@ -1208,6 +1210,18 @@ class _DayWorkspaceState extends State<_DayWorkspace> {
 // ─────────────────────────────────────────────────────────────────────────────
 // PDF planilla por día
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Fracción de pageH reservada para el encabezado (día + fecha) de la hoja
+/// del horario más temprano. Se reserva en todas las hojas para que la
+/// grilla de boletos quede alineada igual, pero solo se dibuja texto en la
+/// hoja más temprana.
+const double _kTandaHeaderFraction = 0.035;
+
+int _toMinutes(String hhmm) {
+  final p = hhmm.split(':');
+  return int.parse(p[0]) * 60 + int.parse(p[1]);
+}
+
 Future<void> printDiaPdf(
   DateTime date,
   HorariosData data,
@@ -1222,40 +1236,62 @@ Future<void> printDiaPdf(
   final pageFormat = paper.pdfFormat;
   final double pageW = pageFormat.width;
   final double pageH = pageFormat.height;
+  final double headerHeightPt = pageH * _kTandaHeaderFraction;
   const double scale = 2.0;
   final int imgW = (pageW * scale).round();
-  final int imgH = (pageH * scale).round();
+  final int imgH = ((pageH - headerHeightPt) * scale).round();
   final dateStr = _fmt(date);
+  final dayName = _longNames[date.weekday - 1];
+  final earliestTime = times.reduce(
+    (a, b) => _toMinutes(a) <= _toMinutes(b) ? a : b,
+  );
 
-  final doc = pw.Document();
+  final cache = TandaPdfCacheService.instance;
+  final pageBytes = <Uint8List>[];
+  final isEarliestFlags = <bool>[];
+
   // Se recorre en orden inverso: la impresora suele apilar las hojas boca
   // abajo, por lo que la última en imprimirse queda arriba de la pila.
   // Así, al tomar la pila física, el primer horario queda primero.
   for (final time in times.reversed) {
-    final recorder = ui.PictureRecorder();
-    final canvas = Canvas(
-      recorder,
-      Rect.fromLTWH(0, 0, imgW.toDouble(), imgH.toDouble()),
-    );
-    PlanillaPainter(
+    final cacheKey = TandaPdfCacheService.key(
       destination: destination,
+      date: date,
       time: time,
-      date: dateStr,
-    ).paint(canvas, Size(imgW.toDouble(), imgH.toDouble()));
-    final picture = recorder.endRecording();
-    final image = await picture.toImage(imgW, imgH);
-    final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-    image.dispose();
-    final bytes = byteData!.buffer.asUint8List();
-    doc.addPage(
-      pw.Page(
-        pageFormat: pageFormat,
-        margin: pw.EdgeInsets.zero,
-        build: (_) => pw.Image(pw.MemoryImage(bytes), fit: pw.BoxFit.contain),
-      ),
+      paper: paper,
     );
+    var bytes = cache.get(cacheKey);
+    if (bytes == null) {
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(
+        recorder,
+        Rect.fromLTWH(0, 0, imgW.toDouble(), imgH.toDouble()),
+      );
+      PlanillaPainter(
+        destination: destination,
+        time: time,
+        date: dateStr,
+      ).paint(canvas, Size(imgW.toDouble(), imgH.toDouble()));
+      final picture = recorder.endRecording();
+      final image = await picture.toImage(imgW, imgH);
+      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+      image.dispose();
+      bytes = byteData!.buffer.asUint8List();
+      cache.put(cacheKey, bytes);
+    }
+    pageBytes.add(bytes);
+    isEarliestFlags.add(time == earliestTime);
   }
-  await Printing.layoutPdf(onLayout: (_) => doc.save());
+
+  final pdfBytes = await compute(buildTandaPdfInIsolate, (
+    pageBytes,
+    isEarliestFlags,
+    pageFormat,
+    dayName,
+    dateStr,
+    headerHeightPt,
+  ));
+  await Printing.layoutPdf(onLayout: (_) => Future.value(pdfBytes));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
